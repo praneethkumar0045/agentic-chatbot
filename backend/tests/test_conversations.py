@@ -2,6 +2,7 @@ from collections.abc import Generator
 
 import pytest
 from fastapi.testclient import TestClient
+from langchain_core.messages import AIMessage, HumanMessage
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -142,6 +143,59 @@ def test_chat_requires_owned_thread_and_uses_conversation_id(
         assert conversation.title == "Hello Medha"
 
 
+def test_chat_persists_history_and_reuses_it_for_follow_up_turns(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.api.v1.router as chat_router
+
+    token = create_user(client, "history@example.com")
+    headers = auth(token)
+    thread_id = client.post("/api/v1/conversations", json={}, headers=headers).json()["id"]
+    received_histories: list[list[tuple[str, str]]] = []
+
+    def fake_chat(messages, thread_id):
+        received_histories.append([(message.role, message.content) for message in messages])
+        history = [
+            HumanMessage(content=message.content)
+            if message.role == "user"
+            else AIMessage(content=message.content)
+            for message in messages
+        ]
+        return [*history, AIMessage(content=f"Answer {len(received_histories)}")]
+
+    monkeypatch.setattr(chat_router.chat_service, "chat", fake_chat)
+
+    first_response = client.post(
+        "/api/v1/chat",
+        json={"thread_id": thread_id, "messages": [{"role": "user", "content": "First question"}]},
+        headers=headers,
+    )
+    second_response = client.post(
+        "/api/v1/chat",
+        json={"thread_id": thread_id, "messages": [{"role": "user", "content": "Follow-up"}]},
+        headers=headers,
+    )
+    detail = client.get(f"/api/v1/conversations/{thread_id}", headers=headers)
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert received_histories == [
+        [("user", "First question")],
+        [
+            ("user", "First question"),
+            ("assistant", "Answer 1"),
+            ("user", "Follow-up"),
+        ],
+    ]
+    assert detail.json()["messages"] == [
+        {"role": "user", "content": "First question", "metadata": None},
+        {"role": "assistant", "content": "Answer 1", "metadata": None},
+        {"role": "user", "content": "Follow-up", "metadata": None},
+        {"role": "assistant", "content": "Answer 2", "metadata": None},
+    ]
+
+
 def test_stream_chat_checks_ownership_before_starting_stream(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -151,10 +205,10 @@ def test_stream_chat_checks_ownership_before_starting_stream(
     first_token = create_user(client, "first@example.com")
     second_token = create_user(client, "second@example.com")
     thread_id = client.post("/api/v1/conversations", json={}, headers=auth(first_token)).json()["id"]
-    calls: list[str] = []
+    calls: list[tuple[str, list[tuple[str, str]]]] = []
 
     def fake_stream(messages, thread_id):
-        calls.append(thread_id)
+        calls.append((thread_id, [(message.role, message.content) for message in messages]))
         yield type("Chunk", (), {"content": "ok", "type": "message"})()
 
     monkeypatch.setattr(chat_router.chat_service, "stream_chat", fake_stream)
@@ -167,4 +221,22 @@ def test_stream_chat_checks_ownership_before_starting_stream(
     response = client.post("/api/v1/chat/stream", json=payload, headers=auth(first_token))
     assert response.status_code == 200
     assert response.text == 'data: {"content": "ok", "type": "message"}\n\n'
-    assert calls == [thread_id]
+    assert calls == [(thread_id, [("user", "Hello")])]
+
+    follow_up = client.post(
+        "/api/v1/chat/stream",
+        json={"thread_id": thread_id, "messages": [{"role": "user", "content": "Follow-up"}]},
+        headers=auth(first_token),
+    )
+    assert follow_up.status_code == 200
+    assert calls[-1] == (
+        thread_id,
+        [("user", "Hello"), ("assistant", "ok"), ("user", "Follow-up")],
+    )
+    detail = client.get(f"/api/v1/conversations/{thread_id}", headers=auth(first_token))
+    assert detail.json()["messages"] == [
+        {"role": "user", "content": "Hello", "metadata": None},
+        {"role": "assistant", "content": "ok", "metadata": None},
+        {"role": "user", "content": "Follow-up", "metadata": None},
+        {"role": "assistant", "content": "ok", "metadata": None},
+    ]

@@ -48,6 +48,18 @@ def touch_conversation(
     db.commit()
 
 
+def append_messages(
+    db: Session,
+    conversation: Conversation,
+    messages: list[dict[str, str]],
+) -> None:
+    if not messages:
+        return
+    conversation.messages = [*conversation.messages, *messages]
+    conversation.updated_at = utc_now()
+    db.commit()
+
+
 def delete_conversation(db: Session, conversation: Conversation) -> None:
     db.delete(conversation)
     db.commit()

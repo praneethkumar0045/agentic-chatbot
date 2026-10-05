@@ -3,7 +3,6 @@ from langgraph.graph.message import add_messages
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, START, END
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage
-from langgraph.checkpoint.memory import MemorySaver
 
 from app.core import settings
 
@@ -30,9 +29,7 @@ graph.add_node("chat_node", _chat_node)
 graph.add_edge(START, "chat_node")
 graph.add_edge("chat_node", END)
 
-
-checkpointer = MemorySaver()
-chatbot = graph.compile(checkpointer=checkpointer)
+chatbot = graph.compile()
 
 
 def _to_base_message(m):
@@ -51,23 +48,15 @@ def _to_base_message(m):
 
 def chat(messages, thread_id: str):
     base_msgs = [_to_base_message(x) for x in messages]
-    config = {"configurable": {"thread_id": thread_id}}
     state = {"messages": base_msgs}
-    result = chatbot.invoke(state, config=config)
+    result = chatbot.invoke(state)
     return result["messages"]
 
 
 def stream_chat(messages, thread_id: str):
     base_msgs = [_to_base_message(x) for x in messages]
-    config = {"configurable": {"thread_id": thread_id}}
     state = {"messages": base_msgs}
     for message_chunk, metadata in chatbot.stream(
-        state, config=config, stream_mode="messages"
+        state, stream_mode="messages"
     ):
         yield message_chunk
-
-
-def get_thread_messages(thread_id: str):
-    config = {"configurable": {"thread_id": thread_id}}
-    state = chatbot.get_state(config)
-    return state.values.get("messages", [])
