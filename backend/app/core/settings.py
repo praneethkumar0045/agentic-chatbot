@@ -6,6 +6,7 @@ load_dotenv()
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.7"))
 MAX_OUTPUT_TOKENS = os.getenv("MAX_OUTPUT_TOKENS")
 DATABASE_URL = os.getenv("DATABASE_URL")

@@ -85,10 +85,20 @@ def chat_stream(req: ChatRequest, db: DatabaseSession, user: CurrentUser):
         assistant_response = ""
         for chunk in chat_service.stream_chat(history, thread_id=req.thread_id):
             content_str = content_to_text(getattr(chunk, "content", ""))
-            ctype = getattr(chunk, "type", "")
-            if ctype != "tool":
-                assistant_response += content_str
-            yield f"data: {json.dumps({'content': content_str, 'type': ctype or 'message'})}\n\n"
+            chunk_type = getattr(chunk, "type", "")
+            tool_calls = getattr(chunk, "tool_call_chunks", None) or getattr(
+                chunk, "tool_calls", None
+            )
+            if tool_calls:
+                yield f"data: {json.dumps({'content': 'Searching the web...', 'type': 'status'})}\n\n"
+                continue
+            is_tool_message = chunk_type.lower() in {"tool", "toolmessagechunk"} or bool(
+                getattr(chunk, "tool_call_id", None)
+            )
+            if is_tool_message:
+                continue
+            assistant_response += content_str
+            yield f"data: {json.dumps({'content': content_str, 'type': 'message'})}\n\n"
         if assistant_response:
             conversation_service.append_messages(
                 db,

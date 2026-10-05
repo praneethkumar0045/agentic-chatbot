@@ -1,6 +1,8 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
+import { FormEvent, memo, useCallback, useEffect, useRef, useState } from "react";
+import ReactMarkdown, { type Components } from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { authenticatedFetch } from "@/lib/auth/client";
 import type { User } from "@/lib/auth/types";
 import { API_BASE_URL } from "@/lib/api/config";
@@ -15,6 +17,14 @@ import {
 type Message = { role: "user" | "assistant"; content: string };
 type Conversation = ConversationSummary & {
   messages: Message[];
+};
+
+const markdownComponents: Components = {
+  table: ({ children, ...props }) => (
+    <div className="markdown-table-wrap">
+      <table {...props}>{children}</table>
+    </div>
+  ),
 };
 
 const suggestions = [
@@ -58,6 +68,44 @@ function Icon({
   return <svg {...common}><path d="m18 6-12 12M6 6l12 12" /></svg>;
 }
 
+const ChatMessageRow = memo(function ChatMessageRow({
+  message,
+  isLoadingLast,
+  toolStatus,
+}: {
+  message: Message;
+  isLoadingLast: boolean;
+  toolStatus: string;
+}) {
+  return (
+    <div className={`message-row ${message.role === "user" ? "message-user" : "message-assistant"}`}>
+      {message.role === "assistant" && <div className="avatar avatar-assistant"><Icon name="spark" size={16} /></div>}
+      <div className={`message-content ${message.role === "user" ? "user-bubble" : "markdown-body"}`}>
+        {message.role === "assistant" && message.content ? (
+          <ReactMarkdown
+            remarkPlugins={[remarkGfm]}
+            components={markdownComponents}
+          >
+            {message.content}
+          </ReactMarkdown>
+        ) : message.content ? (
+          message.content
+        ) : isLoadingLast ? (
+          toolStatus ? (
+            <span className="tool-status" role="status">
+              <span className="tool-status-spinner" aria-hidden="true" />
+              <span>{toolStatus}</span>
+            </span>
+          ) : (
+            <span className="typing"><i /><i /><i /></span>
+          )
+        ) : null}
+      </div>
+      {message.role === "user" && <div className="avatar avatar-user">Y</div>}
+    </div>
+  );
+});
+
 export function ChatWorkspace({
   user,
   onSignOut,
@@ -69,6 +117,7 @@ export function ChatWorkspace({
   const [activeId, setActiveId] = useState("");
   const [draft, setDraft] = useState("");
   const [isLoading, setIsLoading] = useState(false);
+  const [toolStatus, setToolStatus] = useState("");
   const [isOnline, setIsOnline] = useState<boolean | null>(null);
   const [error, setError] = useState("");
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -199,6 +248,7 @@ export function ChatWorkspace({
     const assistantMessage: Message = { role: "assistant", content: "" };
     setDraft("");
     setError("");
+    setToolStatus("");
     setIsLoading(true);
     setConversations((items) =>
       items.map((item) =>
@@ -261,7 +311,12 @@ export function ChatWorkspace({
             ?.slice(6);
           if (!data) continue;
           const eventData = JSON.parse(data) as { content?: string; type?: string };
-          if (eventData.type !== "tool") appendChunk(eventData.content ?? "");
+          if (eventData.type === "status") {
+            setToolStatus(eventData.content ?? "");
+          } else if (eventData.type === "message") {
+            setToolStatus("");
+            appendChunk(eventData.content ?? "");
+          }
         }
         if (done) break;
       }
@@ -298,6 +353,7 @@ export function ChatWorkspace({
       }
     } finally {
       abortRef.current = null;
+      setToolStatus("");
       setIsLoading(false);
     }
   };
@@ -387,13 +443,12 @@ export function ChatWorkspace({
           ) : activeConversation?.messages.length ? (
             <div className="messages">
               {activeConversation.messages.map((message, index) => (
-                <div className={`message-row ${message.role === "user" ? "message-user" : "message-assistant"}`} key={`${activeConversation.id}-${index}`}>
-                  {message.role === "assistant" && <div className="avatar avatar-assistant"><Icon name="spark" size={16} /></div>}
-                  <div className={`message-content ${message.role === "user" ? "user-bubble" : ""}`}>
-                    {message.content || (isLoading && index === activeConversation.messages.length - 1 ? <span className="typing"><i /><i /><i /></span> : null)}
-                  </div>
-                  {message.role === "user" && <div className="avatar avatar-user">Y</div>}
-                </div>
+                <ChatMessageRow
+                  key={`${activeConversation.id}-${index}`}
+                  message={message}
+                  isLoadingLast={isLoading && index === activeConversation.messages.length - 1}
+                  toolStatus={index === activeConversation.messages.length - 1 ? toolStatus : ""}
+                />
               ))}
               <div ref={bottomRef} />
             </div>

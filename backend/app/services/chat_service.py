@@ -1,11 +1,27 @@
+import logging
 from typing import TypedDict, Annotated
+
+from langchain_tavily import TavilySearch
 from langgraph.graph.message import add_messages
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, START, END
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage
+from langchain_core.messages import (
+    BaseMessage,
+    HumanMessage,
+    AIMessage,
+    SystemMessage,
+    ToolMessage,
+)
+from langgraph.prebuilt import ToolNode, tools_condition
 
 from app.core import settings
 
+logger = logging.getLogger(__name__)
+SYSTEM_PROMPT = (
+    "For current or fast-changing information, use web search before answering. "
+    "Use the search results as your source of truth and mention relevant sources "
+    "when appropriate."
+)
 
 class ChatState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
@@ -19,17 +35,31 @@ llm = ChatGoogleGenerativeAI(
     max_retries=2,
 )
 
+tools = []
+if settings.TAVILY_API_KEY:
+    tools = [TavilySearch(max_results=5, tavily_api_key=settings.TAVILY_API_KEY)]
+else:
+    logger.warning("TAVILY_API_KEY is not configured; web search is disabled.")
 
-def _chat_node(state: ChatState):
-    return {"messages": [llm.invoke(state["messages"])]}
+def _build_chatbot(model, search_tools):
+    model_with_tools = model.bind_tools(search_tools) if search_tools else model
+
+    def chat_node(state: ChatState):
+        return {"messages": [model_with_tools.invoke(state["messages"])]}
+
+    graph = StateGraph(ChatState)
+    graph.add_node("chat_node", chat_node)
+    graph.add_edge(START, "chat_node")
+    if search_tools:
+        graph.add_node("tools", ToolNode(search_tools))
+        graph.add_conditional_edges("chat_node", tools_condition)
+        graph.add_edge("tools", "chat_node")
+    else:
+        graph.add_edge("chat_node", END)
+    return graph.compile()
 
 
-graph = StateGraph(ChatState)
-graph.add_node("chat_node", _chat_node)
-graph.add_edge(START, "chat_node")
-graph.add_edge("chat_node", END)
-
-chatbot = graph.compile()
+chatbot = _build_chatbot(llm, tools)
 
 
 def _to_base_message(m):
@@ -48,15 +78,13 @@ def _to_base_message(m):
 
 def chat(messages, thread_id: str):
     base_msgs = [_to_base_message(x) for x in messages]
-    state = {"messages": base_msgs}
+    state = {"messages": [SystemMessage(content=SYSTEM_PROMPT), *base_msgs]}
     result = chatbot.invoke(state)
     return result["messages"]
 
 
 def stream_chat(messages, thread_id: str):
     base_msgs = [_to_base_message(x) for x in messages]
-    state = {"messages": base_msgs}
-    for message_chunk, metadata in chatbot.stream(
-        state, stream_mode="messages"
-    ):
+    state = {"messages": [SystemMessage(content=SYSTEM_PROMPT), *base_msgs]}
+    for message_chunk, _metadata in chatbot.stream(state, stream_mode="messages"):
         yield message_chunk

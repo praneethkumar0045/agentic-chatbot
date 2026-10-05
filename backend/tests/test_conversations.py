@@ -209,6 +209,24 @@ def test_stream_chat_checks_ownership_before_starting_stream(
 
     def fake_stream(messages, thread_id):
         calls.append((thread_id, [(message.role, message.content) for message in messages]))
+        yield type(
+            "ToolCallChunk",
+            (),
+            {
+                "content": "",
+                "type": "AIMessageChunk",
+                "tool_call_chunks": [{"name": "tavily_search"}],
+            },
+        )()
+        yield type(
+            "ToolChunk",
+            (),
+            {
+                "content": "Search result should not be shown as assistant text",
+                "type": "ToolMessageChunk",
+                "tool_call_id": "search-1",
+            },
+        )()
         yield type("Chunk", (), {"content": "ok", "type": "message"})()
 
     monkeypatch.setattr(chat_router.chat_service, "stream_chat", fake_stream)
@@ -220,7 +238,11 @@ def test_stream_chat_checks_ownership_before_starting_stream(
 
     response = client.post("/api/v1/chat/stream", json=payload, headers=auth(first_token))
     assert response.status_code == 200
-    assert response.text == 'data: {"content": "ok", "type": "message"}\n\n'
+    assert response.text == (
+        'data: {"content": "Searching the web...", "type": "status"}\n\n'
+        'data: {"content": "ok", "type": "message"}\n\n'
+    )
+    assert "Search result should not be shown as assistant text" not in response.text
     assert calls == [(thread_id, [("user", "Hello")])]
 
     follow_up = client.post(
