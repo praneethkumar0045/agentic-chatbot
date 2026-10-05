@@ -1,45 +1,25 @@
-from fastapi import APIRouter
-from fastapi.responses import StreamingResponse, JSONResponse
+from typing import Annotated
 import json
 
-from app.schemas.chat import ChatRequest, ChatResponse, ChatMessage
+from fastapi import APIRouter, Depends
+from fastapi.responses import StreamingResponse
+from sqlalchemy.orm import Session
+
+from app.api.v1.auth import get_current_user, router as auth_router
+from app.api.v1.chat_utils import content_to_text, message_to_schema
+from app.api.v1.conversations import router as conversations_router
+from app.db.session import get_db
+from app.models import User
+from app.schemas.chat import ChatRequest, ChatResponse
 from app.services import chat_service
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage, SystemMessage
-from app.api.v1.auth import router as auth_router
-
-
-def _content_to_text(content):
-    if isinstance(content, list):
-        text_parts = []
-        for part in content:
-            if isinstance(part, str):
-                text_parts.append(part)
-            elif isinstance(part, dict) and isinstance(part.get("text"), str):
-                text_parts.append(part["text"])
-        return "".join(text_parts)
-    if content is None:
-        return ""
-    return content if isinstance(content, str) else str(content)
-
-
-def _msg_to_schema(m):
-    if isinstance(m, HumanMessage):
-        role = "user"
-    elif isinstance(m, AIMessage):
-        role = "assistant"
-    elif isinstance(m, ToolMessage):
-        role = "tool"
-    elif isinstance(m, SystemMessage):
-        role = "system"
-    else:
-        t = getattr(m, "type", None) or getattr(m, "role", None) or "assistant"
-        role = "assistant" if t == "thought" else t
-    content = _content_to_text(getattr(m, "content", ""))
-    return ChatMessage(role=role, content=content)
+from app.services import conversation_service
 
 
 router = APIRouter()
 router.include_router(auth_router, prefix="/auth", tags=["auth"])
+router.include_router(conversations_router)
+DatabaseSession = Annotated[Session, Depends(get_db)]
+CurrentUser = Annotated[User, Depends(get_current_user)]
 
 
 @router.get("/")
@@ -53,16 +33,29 @@ def health():
 
 
 @router.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest):
-    result_msgs = chat_service.chat(req.messages, thread_id=req.thread_id or "default")
-    return ChatResponse(messages=[_msg_to_schema(m) for m in result_msgs])
+def chat(req: ChatRequest, db: DatabaseSession, user: CurrentUser):
+    conversation = conversation_service.get_owned_conversation(db, user, req.thread_id)
+    conversation_service.touch_conversation(
+        db,
+        conversation,
+        initial_message=req.messages[0].content if req.messages else None,
+    )
+    result_msgs = chat_service.chat(req.messages, thread_id=req.thread_id)
+    return ChatResponse(messages=[message_to_schema(message) for message in result_msgs])
 
 
 @router.post("/chat/stream")
-def chat_stream(req: ChatRequest):
+def chat_stream(req: ChatRequest, db: DatabaseSession, user: CurrentUser):
+    conversation = conversation_service.get_owned_conversation(db, user, req.thread_id)
+    conversation_service.touch_conversation(
+        db,
+        conversation,
+        initial_message=req.messages[0].content if req.messages else None,
+    )
+
     def gen():
-        for chunk in chat_service.stream_chat(req.messages, thread_id=req.thread_id or "default"):
-            content_str = _content_to_text(getattr(chunk, "content", ""))
+        for chunk in chat_service.stream_chat(req.messages, thread_id=req.thread_id):
+            content_str = content_to_text(getattr(chunk, "content", ""))
             ctype = getattr(chunk, "type", "")
             yield f"data: {json.dumps({'content': content_str, 'type': ctype or 'message'})}\n\n"
 

@@ -49,7 +49,7 @@ def _to_base_message(m):
     return HumanMessage(content=content)
 
 
-def chat(messages, thread_id: str = "default"):
+def chat(messages, thread_id: str):
     base_msgs = [_to_base_message(x) for x in messages]
     config = {"configurable": {"thread_id": thread_id}}
     state = {"messages": base_msgs}
@@ -57,7 +57,7 @@ def chat(messages, thread_id: str = "default"):
     return result["messages"]
 
 
-def stream_chat(messages, thread_id: str = "default"):
+def stream_chat(messages, thread_id: str):
     base_msgs = [_to_base_message(x) for x in messages]
     config = {"configurable": {"thread_id": thread_id}}
     state = {"messages": base_msgs}
@@ -65,3 +65,9 @@ def stream_chat(messages, thread_id: str = "default"):
         state, config=config, stream_mode="messages"
     ):
         yield message_chunk
+
+
+def get_thread_messages(thread_id: str):
+    config = {"configurable": {"thread_id": thread_id}}
+    state = chatbot.get_state(config)
+    return state.values.get("messages", [])

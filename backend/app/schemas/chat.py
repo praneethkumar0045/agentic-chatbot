@@ -1,19 +1,20 @@
-from typing import List, Optional, Any
-from pydantic import BaseModel
+from typing import Any
+
+from pydantic import BaseModel, Field
 
 
 class ChatMessage(BaseModel):
     role: str
     content: str
-    metadata: Optional[dict[str, Any]] = None
+    metadata: dict[str, Any] | None = None
 
 
 class ChatRequest(BaseModel):
-    messages: List[ChatMessage]
-    thread_id: Optional[str] = None
-    temperature: Optional[float] = None
-    max_tokens: Optional[int] = None
+    messages: list[ChatMessage] = Field(min_length=1)
+    thread_id: str = Field(min_length=1, max_length=36)
+    temperature: float | None = None
+    max_tokens: int | None = None
 
 
 class ChatResponse(BaseModel):
-    messages: List[ChatMessage]
+    messages: list[ChatMessage]

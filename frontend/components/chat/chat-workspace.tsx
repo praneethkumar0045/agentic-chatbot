@@ -4,13 +4,17 @@ import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import { authenticatedFetch } from "@/lib/auth/client";
 import type { User } from "@/lib/auth/types";
 import { API_BASE_URL } from "@/lib/api/config";
+import {
+  createConversation as createConversationRequest,
+  deleteConversation as deleteConversationRequest,
+  getConversation,
+  listConversations,
+  type ConversationSummary,
+} from "@/lib/conversations/client";
 
 type Message = { role: "user" | "assistant"; content: string };
-type Conversation = {
-  id: string;
-  title: string;
+type Conversation = ConversationSummary & {
   messages: Message[];
-  updatedAt: number;
 };
 
 const suggestions = [
@@ -54,15 +58,6 @@ function Icon({
   return <svg {...common}><path d="m18 6-12 12M6 6l12 12" /></svg>;
 }
 
-function makeConversation(): Conversation {
-  return {
-    id: crypto.randomUUID(),
-    title: "New conversation",
-    messages: [],
-    updatedAt: Date.now(),
-  };
-}
-
 export function ChatWorkspace({
   user,
   onSignOut,
@@ -77,36 +72,43 @@ export function ChatWorkspace({
   const [isOnline, setIsOnline] = useState<boolean | null>(null);
   const [error, setError] = useState("");
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [ready, setReady] = useState(false);
+  const [isConversationBusy, setIsConversationBusy] = useState(true);
   const abortRef = useRef<AbortController | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const activeConversation = conversations.find((item) => item.id === activeId);
 
   useEffect(() => {
-    try {
-      const stored = localStorage.getItem("agentic-chat-conversations");
-      const saved = stored ? (JSON.parse(stored) as Conversation[]) : [];
-      if (Array.isArray(saved) && saved.length) {
-        // Restore browser-persisted conversations after the client mounts.
-        // eslint-disable-next-line react-hooks/set-state-in-effect
-        setConversations(saved);
-        setActiveId(saved[0].id);
-      } else {
-        const fresh = makeConversation();
-        setConversations([fresh]);
-        setActiveId(fresh.id);
+    let cancelled = false;
+    const loadConversations = async () => {
+      try {
+        let summaries = await listConversations();
+        if (summaries.length === 0) {
+          summaries = [await createConversationRequest()];
+        }
+        if (cancelled) return;
+        setConversations(summaries.map((conversation) => ({ ...conversation, messages: [] })));
+        setActiveId(summaries[0].id);
+        const detail = await getConversation(summaries[0].id);
+        if (!cancelled) {
+          setConversations((items) =>
+            items.map((conversation) =>
+              conversation.id === detail.id ? { ...conversation, messages: detail.messages } : conversation,
+            ),
+          );
+        }
+      } catch (caught) {
+        if (!cancelled) {
+          setError(caught instanceof Error ? caught.message : "Unable to load your conversations.");
+        }
+      } finally {
+        if (!cancelled) setIsConversationBusy(false);
       }
-    } catch {
-      const fresh = makeConversation();
-      setConversations([fresh]);
-      setActiveId(fresh.id);
-    }
-    setReady(true);
+    };
+    void loadConversations();
+    return () => {
+      cancelled = true;
+    };
   }, []);
-
-  useEffect(() => {
-    if (ready) localStorage.setItem("agentic-chat-conversations", JSON.stringify(conversations));
-  }, [conversations, ready]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -120,20 +122,77 @@ export function ChatWorkspace({
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [activeConversation?.messages]);
 
-  const startConversation = useCallback(() => {
-    if (isLoading) return;
-    const fresh = makeConversation();
-    setConversations((items) => [fresh, ...items]);
-    setActiveId(fresh.id);
-    setDraft("");
+  const startConversation = useCallback(async () => {
+    if (isLoading || isConversationBusy) return;
+    setIsConversationBusy(true);
     setError("");
+    try {
+      const created = await createConversationRequest();
+      setConversations((items) => [{ ...created, messages: [] }, ...items]);
+      setActiveId(created.id);
+      setDraft("");
+      setSidebarOpen(false);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Unable to create a conversation.");
+    } finally {
+      setIsConversationBusy(false);
+    }
+  }, [isConversationBusy, isLoading]);
+
+  const selectConversation = async (conversationId: string) => {
+    if (isLoading || isConversationBusy || conversationId === activeId) return;
+    setActiveId(conversationId);
     setSidebarOpen(false);
-  }, [isLoading]);
+    setError("");
+    setIsConversationBusy(true);
+    try {
+      const detail = await getConversation(conversationId);
+      setConversations((items) =>
+        items.map((conversation) =>
+          conversation.id === detail.id ? { ...conversation, ...detail } : conversation,
+        ),
+      );
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Unable to load this conversation.");
+    } finally {
+      setIsConversationBusy(false);
+    }
+  };
+
+  const removeConversation = async (conversationId: string) => {
+    if (isLoading || isConversationBusy || !window.confirm("Delete this conversation?")) return;
+    setIsConversationBusy(true);
+    setError("");
+    try {
+      await deleteConversationRequest(conversationId);
+      const remaining = conversations.filter((conversation) => conversation.id !== conversationId);
+      if (remaining.length === 0) {
+        const created = await createConversationRequest();
+        setConversations([{ ...created, messages: [] }]);
+        setActiveId(created.id);
+      } else {
+        setConversations(remaining);
+        if (activeId === conversationId) {
+          setActiveId(remaining[0].id);
+          const detail = await getConversation(remaining[0].id);
+          setConversations((items) =>
+            items.map((conversation) =>
+              conversation.id === detail.id ? { ...conversation, ...detail } : conversation,
+            ),
+          );
+        }
+      }
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Unable to delete this conversation.");
+    } finally {
+      setIsConversationBusy(false);
+    }
+  };
 
   const sendMessage = async (event?: FormEvent, initialText?: string) => {
     event?.preventDefault();
     const content = (initialText ?? draft).trim();
-    if (!content || isLoading || !activeConversation) return;
+    if (!content || isLoading || isConversationBusy || !activeConversation) return;
 
     const conversationId = activeConversation.id;
     const userMessage: Message = { role: "user", content };
@@ -147,8 +206,8 @@ export function ChatWorkspace({
           ? {
               ...item,
               title: item.messages.length ? item.title : content.slice(0, 42),
+              updated_at: new Date().toISOString(),
               messages: [...item.messages, userMessage, assistantMessage],
-              updatedAt: Date.now(),
             }
           : item,
       ),
@@ -185,7 +244,7 @@ export function ChatWorkspace({
             if (last?.role === "assistant") {
               messages[messages.length - 1] = { ...last, content: last.content + chunk };
             }
-            return { ...item, messages, updatedAt: Date.now() };
+            return { ...item, messages, updated_at: new Date().toISOString() };
           }),
         );
       };
@@ -207,6 +266,17 @@ export function ChatWorkspace({
         if (done) break;
       }
       setIsOnline(true);
+      try {
+        const summaries = await listConversations();
+        setConversations((items) =>
+          summaries.map((summary) => ({
+            ...summary,
+            messages: items.find((item) => item.id === summary.id)?.messages ?? [],
+          })),
+        );
+      } catch {
+        setError("Your reply arrived, but the conversation list could not be refreshed.");
+      }
     } catch (caught) {
       const wasAborted = caught instanceof DOMException && caught.name === "AbortError";
       setConversations((items) =>
@@ -238,14 +308,14 @@ export function ChatWorkspace({
     <main className="app-shell">
       <aside className={`sidebar ${sidebarOpen ? "sidebar-open" : ""}`}>
         <div className="sidebar-top">
-          <a className="brand" href="#" aria-label="Medha home" onClick={() => startConversation()}>
+          <a className="brand" href="#" aria-label="Medha home" onClick={(event) => { event.preventDefault(); void startConversation(); }}>
             <span className="brand-mark"><Icon name="spark" size={19} /></span>
             <span>Medha</span>
           </a>
           <button className="icon-button mobile-close" onClick={() => setSidebarOpen(false)} aria-label="Close menu">
             <Icon name="close" />
           </button>
-          <button className="new-chat-button" onClick={startConversation}>
+          <button className="new-chat-button" onClick={() => void startConversation()} disabled={isConversationBusy || isLoading}>
             <Icon name="plus" size={17} />
             <span>New conversation</span>
             <kbd>⌘ K</kbd>
@@ -259,21 +329,27 @@ export function ChatWorkspace({
           <div className="nav-label history-label">YOUR CHATS</div>
           <div className="conversation-list">
             {conversations.map((conversation) => (
-              <button
-                key={conversation.id}
-                className={`conversation-item ${conversation.id === activeId ? "conversation-active" : ""}`}
-                onClick={() => {
-                  if (!isLoading) {
-                    setActiveId(conversation.id);
-                    setSidebarOpen(false);
-                    setError("");
-                  }
-                }}
-                title={conversation.title}
-              >
-                <span className="conversation-dot" />
-                <span>{conversation.title}</span>
-              </button>
+              <div className="conversation-entry" key={conversation.id}>
+                <button
+                  className={`conversation-item ${conversation.id === activeId ? "conversation-active" : ""}`}
+                  onClick={() => void selectConversation(conversation.id)}
+                  disabled={isLoading || isConversationBusy}
+                  title={conversation.title}
+                >
+                  <span className="conversation-dot" />
+                  <span>{conversation.title}</span>
+                </button>
+                <button
+                  className="conversation-delete"
+                  type="button"
+                  aria-label={`Delete ${conversation.title}`}
+                  title="Delete conversation"
+                  disabled={isLoading || isConversationBusy}
+                  onClick={() => void removeConversation(conversation.id)}
+                >
+                  ×
+                </button>
+              </div>
             ))}
           </div>
         </div>
@@ -306,7 +382,9 @@ export function ChatWorkspace({
         </header>
 
         <div className={`chat-area ${activeConversation?.messages.length ? "chat-area-active" : ""}`}>
-          {activeConversation?.messages.length ? (
+          {isConversationBusy && !activeConversation ? (
+            <div className="welcome-loading">Loading your conversations…</div>
+          ) : activeConversation?.messages.length ? (
             <div className="messages">
               {activeConversation.messages.map((message, index) => (
                 <div className={`message-row ${message.role === "user" ? "message-user" : "message-assistant"}`} key={`${activeConversation.id}-${index}`}>
@@ -331,7 +409,7 @@ export function ChatWorkspace({
               <p className="welcome-subtitle">I’m Medha. Bring a question, a half-formed thought,<br className="desktop-break" /> or something you’re curious about.</p>
               <div className="suggestions">
                 {suggestions.map((suggestion) => (
-                  <button className="suggestion-card" key={suggestion.title} onClick={() => sendMessage(undefined, suggestion.prompt)}>
+                  <button className="suggestion-card" key={suggestion.title} onClick={() => void sendMessage(undefined, suggestion.prompt)} disabled={isConversationBusy}>
                     <span className="suggestion-icon">{suggestion.icon}</span>
                     <span><strong>{suggestion.title}</strong><small>{suggestion.prompt}</small></span>
                     <Icon name="chevron" size={16} />
@@ -344,7 +422,7 @@ export function ChatWorkspace({
 
         <div className="composer-wrap">
           {error && <div className="error-banner" role="alert">{error}<button onClick={() => setError("")}>Dismiss</button></div>}
-          <form className="composer" onSubmit={(event) => sendMessage(event)}>
+          <form className="composer" onSubmit={(event) => void sendMessage(event)}>
             <textarea
               value={draft}
               onChange={(event) => setDraft(event.target.value)}
@@ -363,7 +441,7 @@ export function ChatWorkspace({
               {isLoading ? (
                 <button className="send-button stop-button" type="button" onClick={stopResponse} aria-label="Stop response"><Icon name="stop" size={17} /></button>
               ) : (
-                <button className="send-button" type="submit" disabled={!draft.trim()} aria-label="Send message"><Icon name="send" size={17} /></button>
+                <button className="send-button" type="submit" disabled={!draft.trim() || isConversationBusy} aria-label="Send message"><Icon name="send" size={17} /></button>
               )}
             </div>
           </form>
