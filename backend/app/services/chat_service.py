@@ -1,4 +1,7 @@
+import ast
 import logging
+import math
+import operator
 from typing import TypedDict, Annotated
 
 from langchain_tavily import TavilySearch
@@ -12,6 +15,7 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
+from langchain_core.tools import tool
 from langgraph.prebuilt import ToolNode, tools_condition
 
 from app.core import settings
@@ -22,6 +26,7 @@ SYSTEM_PROMPT = (
     "Use the search results as your source of truth and mention relevant sources "
     "when appropriate."
 )
+
 
 class ChatState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
@@ -35,9 +40,68 @@ llm = ChatGoogleGenerativeAI(
     max_retries=2,
 )
 
-tools = []
+_BINARY_OPERATORS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+}
+_UNARY_OPERATORS = {
+    ast.UAdd: operator.pos,
+    ast.USub: operator.neg,
+}
+
+
+def _evaluate_arithmetic(node):
+    if isinstance(node, ast.Expression):
+        return _evaluate_arithmetic(node.body)
+    if isinstance(node, ast.Constant) and type(node.value) in {int, float}:
+        if isinstance(node.value, int) and node.value.bit_length() > 1024:
+            raise ValueError("Number is too large.")
+        if isinstance(node.value, float) and not math.isfinite(node.value):
+            raise ValueError("Number must be finite.")
+        return node.value
+    if isinstance(node, ast.BinOp) and type(node.op) in _BINARY_OPERATORS:
+        left = _evaluate_arithmetic(node.left)
+        right = _evaluate_arithmetic(node.right)
+        if isinstance(node.op, ast.Pow):
+            if abs(right) > 100:
+                raise ValueError("Exponent must be between -100 and 100.")
+            if isinstance(left, int) and isinstance(right, int) and left.bit_length() * right > 4096:
+                raise ValueError("Result is too large.")
+        result = _BINARY_OPERATORS[type(node.op)](left, right)
+        if isinstance(result, int) and result.bit_length() > 4096:
+            raise ValueError("Result is too large.")
+        if type(result) not in {int, float}:
+            raise ValueError("Result must be a real number.")
+        if isinstance(result, float) and not math.isfinite(result):
+            raise ValueError("Result is not finite.")
+        return result
+    if isinstance(node, ast.UnaryOp) and type(node.op) in _UNARY_OPERATORS:
+        return _UNARY_OPERATORS[type(node.op)](_evaluate_arithmetic(node.operand))
+    raise ValueError("Only basic arithmetic expressions are supported.")
+
+
+@tool
+def calculator(expression: str) -> str:
+    """Calculate a basic arithmetic expression using +, -, *, /, //, %, **, and parentheses."""
+    if len(expression) > 256:
+        return "Error: Expression is too long."
+    try:
+        tree = ast.parse(expression, mode="eval")
+        if sum(1 for _ in ast.walk(tree)) > 64:
+            return "Error: Expression is too complex."
+        return str(_evaluate_arithmetic(tree))
+    except (SyntaxError, ValueError, ZeroDivisionError, OverflowError) as error:
+        return f"Error: {error}"
+
+
+tools = [calculator]
 if settings.TAVILY_API_KEY:
-    tools = [TavilySearch(max_results=5, tavily_api_key=settings.TAVILY_API_KEY)]
+    tools.append(TavilySearch(max_results=5, tavily_api_key=settings.TAVILY_API_KEY))
 else:
     logger.warning("TAVILY_API_KEY is not configured; web search is disabled.")
 
