@@ -10,6 +10,11 @@ export type ConversationSummary = {
 
 export type Conversation = ConversationSummary & {
   messages: { role: "user" | "assistant"; content: string }[];
+  pending_approval?: {
+    type: "approval_required";
+    tool: string;
+    query: string;
+  } | null;
 };
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {

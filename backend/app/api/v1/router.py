@@ -1,7 +1,7 @@
 from typing import Annotated
 import json
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
@@ -33,57 +33,97 @@ def health():
 
 
 @router.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest, db: DatabaseSession, user: CurrentUser):
+def chat(req: ChatRequest, request: Request, db: DatabaseSession, user: CurrentUser):
     conversation = conversation_service.get_owned_conversation(db, user, req.thread_id)
-    conversation_service.touch_conversation(
-        db,
-        conversation,
-        initial_message=req.messages[0].content if req.messages else None,
-    )
-    existing_messages = list(conversation.messages)
-    history = [ChatMessage.model_validate(message) for message in existing_messages]
-    conversation_service.append_messages(
-        db,
-        conversation,
-        [message.model_dump(include={"role", "content"}) for message in req.messages],
-    )
+    graph = request.app.state.chatbot
+    pending = chat_service.pending_approval(graph, req.thread_id)
+    if (req.approval_decision is None and pending is not None) or (
+        req.approval_decision is not None and pending is None
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="There is no matching pending tool approval for this conversation.",
+        )
+    if req.approval_decision is None:
+        existing_messages = list(conversation.messages)
+        history = [ChatMessage.model_validate(message) for message in existing_messages]
+        conversation_service.touch_conversation(
+            db,
+            conversation,
+            initial_message=req.messages[0].content,
+        )
+        conversation_service.append_messages(
+            db,
+            conversation,
+            [message.model_dump(include={"role", "content"}) for message in req.messages],
+        )
+    else:
+        history = []
     result_msgs = chat_service.chat(
-        [*history, *req.messages],
+        req.messages,
         thread_id=req.thread_id,
+        chatbot=graph,
+        fallback_history=history,
+        approval_decision=req.approval_decision,
     )
     response_messages = [message_to_schema(message) for message in result_msgs]
-    conversation_service.append_messages(
-        db,
-        conversation,
-        [
-            message.model_dump(include={"role", "content"})
-            for message in response_messages[len(existing_messages) + len(req.messages):]
-            if message.role in {"assistant", "ai"}
-        ],
-    )
+    if chat_service.pending_approval(graph, req.thread_id) is None:
+        final_assistant = next(
+            (
+                message
+                for message in reversed(response_messages)
+                if message.role in {"assistant", "ai"} and message.content
+            ),
+            None,
+        )
+        if final_assistant is not None:
+            conversation_service.append_messages(
+                db,
+                conversation,
+                [final_assistant.model_dump(include={"role", "content"})],
+            )
     return ChatResponse(messages=response_messages)
 
 
 @router.post("/chat/stream")
-def chat_stream(req: ChatRequest, db: DatabaseSession, user: CurrentUser):
+def chat_stream(req: ChatRequest, request: Request, db: DatabaseSession, user: CurrentUser):
     conversation = conversation_service.get_owned_conversation(db, user, req.thread_id)
-    conversation_service.touch_conversation(
-        db,
-        conversation,
-        initial_message=req.messages[0].content if req.messages else None,
-    )
-    existing_messages = list(conversation.messages)
-    history = [ChatMessage.model_validate(message) for message in existing_messages]
-    conversation_service.append_messages(
-        db,
-        conversation,
-        [message.model_dump(include={"role", "content"}) for message in req.messages],
-    )
-    history.extend(req.messages)
+    graph = request.app.state.chatbot
+    pending = chat_service.pending_approval(graph, req.thread_id)
+    if (req.approval_decision is None and pending is not None) or (
+        req.approval_decision is not None and pending is None
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="There is no matching pending tool approval for this conversation.",
+        )
+
+    history: list[ChatMessage] = []
+    if req.approval_decision is None:
+        history = [ChatMessage.model_validate(message) for message in conversation.messages]
+        conversation_service.touch_conversation(
+            db,
+            conversation,
+            initial_message=req.messages[0].content,
+        )
+        conversation_service.append_messages(
+            db,
+            conversation,
+            [message.model_dump(include={"role", "content"}) for message in req.messages],
+        )
 
     def gen():
         assistant_response = ""
-        for chunk in chat_service.stream_chat(history, thread_id=req.thread_id):
+        for chunk in chat_service.stream_chat(
+            req.messages,
+            thread_id=req.thread_id,
+            chatbot=graph,
+            fallback_history=history,
+            approval_decision=req.approval_decision,
+        ):
+            if isinstance(chunk, dict) and chunk.get("type") == "approval_required":
+                yield f"event: approval_required\ndata: {json.dumps({**chunk, 'thread_id': req.thread_id})}\n\n"
+                continue
             content_str = content_to_text(getattr(chunk, "content", ""))
             chunk_type = getattr(chunk, "type", "")
             tool_calls = getattr(chunk, "tool_call_chunks", None) or getattr(
@@ -99,7 +139,7 @@ def chat_stream(req: ChatRequest, db: DatabaseSession, user: CurrentUser):
                 continue
             assistant_response += content_str
             yield f"data: {json.dumps({'content': content_str, 'type': 'message'})}\n\n"
-        if assistant_response:
+        if assistant_response and chat_service.pending_approval(graph, req.thread_id) is None:
             conversation_service.append_messages(
                 db,
                 conversation,

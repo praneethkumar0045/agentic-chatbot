@@ -7,6 +7,8 @@ langchain-google-genai==2.1.13
 langchain-tavily>=0.2,<1.0
 langgraph==1.2.12
 langgraph-checkpoint==4.2.0
+langgraph-checkpoint-postgres>=2.0,<4.0
+psycopg[binary,pool]>=3.2,<4.0
 langchain-core==1.6.6
 SQLAlchemy>=2.0,<3.0
 alembic>=1.13,<2.0

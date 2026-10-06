@@ -15,8 +15,10 @@ import {
 } from "@/lib/conversations/client";
 
 type Message = { role: "user" | "assistant"; content: string };
+type PendingApproval = { type: "approval_required"; tool: string; query: string };
 type Conversation = ConversationSummary & {
   messages: Message[];
+  pending_approval?: PendingApproval | null;
 };
 
 const markdownComponents: Components = {
@@ -72,10 +74,16 @@ const ChatMessageRow = memo(function ChatMessageRow({
   message,
   isLoadingLast,
   toolStatus,
+  pendingApproval,
+  approvalBusy,
+  onApproval,
 }: {
   message: Message;
   isLoadingLast: boolean;
   toolStatus: string;
+  pendingApproval: PendingApproval | null;
+  approvalBusy: boolean;
+  onApproval: (decision: "approve" | "reject") => void;
 }) {
   return (
     <div className={`message-row ${message.role === "user" ? "message-user" : "message-assistant"}`}>
@@ -100,6 +108,17 @@ const ChatMessageRow = memo(function ChatMessageRow({
             <span className="typing"><i /><i /><i /></span>
           )
         ) : null}
+        {pendingApproval && (
+          <div className="approval-card">
+            <strong>Approve web search?</strong>
+            <span>Medha wants to search the web for:</span>
+            <q>{pendingApproval.query}</q>
+            <div className="approval-actions">
+              <button type="button" disabled={approvalBusy} onClick={() => onApproval("reject")}>Reject</button>
+              <button type="button" disabled={approvalBusy} onClick={() => onApproval("approve")}>Approve search</button>
+            </div>
+          </div>
+        )}
       </div>
       {message.role === "user" && <div className="avatar avatar-user">Y</div>}
     </div>
@@ -126,6 +145,15 @@ export function ChatWorkspace({
   const bottomRef = useRef<HTMLDivElement>(null);
   const activeConversation = conversations.find((item) => item.id === activeId);
 
+  const withPendingPlaceholder = (conversation: Awaited<ReturnType<typeof getConversation>>): Conversation => ({
+    ...conversation,
+    messages:
+      conversation.pending_approval &&
+      conversation.messages[conversation.messages.length - 1]?.role !== "assistant"
+        ? [...conversation.messages, { role: "assistant", content: "" }]
+        : conversation.messages,
+  });
+
   useEffect(() => {
     let cancelled = false;
     const loadConversations = async () => {
@@ -141,7 +169,7 @@ export function ChatWorkspace({
         if (!cancelled) {
           setConversations((items) =>
             items.map((conversation) =>
-              conversation.id === detail.id ? { ...conversation, messages: detail.messages } : conversation,
+              conversation.id === detail.id ? withPendingPlaceholder(detail) : conversation,
             ),
           );
         }
@@ -198,7 +226,7 @@ export function ChatWorkspace({
       const detail = await getConversation(conversationId);
       setConversations((items) =>
         items.map((conversation) =>
-          conversation.id === detail.id ? { ...conversation, ...detail } : conversation,
+          conversation.id === detail.id ? withPendingPlaceholder(detail) : conversation,
         ),
       );
     } catch (caught) {
@@ -226,7 +254,7 @@ export function ChatWorkspace({
           const detail = await getConversation(remaining[0].id);
           setConversations((items) =>
             items.map((conversation) =>
-              conversation.id === detail.id ? { ...conversation, ...detail } : conversation,
+              conversation.id === detail.id ? withPendingPlaceholder(detail) : conversation,
             ),
           );
         }
@@ -238,30 +266,38 @@ export function ChatWorkspace({
     }
   };
 
-  const sendMessage = async (event?: FormEvent, initialText?: string) => {
+  const sendMessage = async (
+    event?: FormEvent,
+    initialText?: string,
+    approvalDecision?: "approve" | "reject",
+  ) => {
     event?.preventDefault();
     const content = (initialText ?? draft).trim();
-    if (!content || isLoading || isConversationBusy || !activeConversation) return;
+    const isResuming = approvalDecision !== undefined;
+    if ((!isResuming && !content) || isLoading || isConversationBusy || !activeConversation) return;
+    if (isResuming && !activeConversation.pending_approval) return;
 
     const conversationId = activeConversation.id;
     const userMessage: Message = { role: "user", content };
     const assistantMessage: Message = { role: "assistant", content: "" };
-    setDraft("");
+    if (!isResuming) setDraft("");
     setError("");
     setToolStatus("");
     setIsLoading(true);
-    setConversations((items) =>
-      items.map((item) =>
-        item.id === conversationId
-          ? {
-              ...item,
-              title: item.messages.length ? item.title : content.slice(0, 42),
-              updated_at: new Date().toISOString(),
-              messages: [...item.messages, userMessage, assistantMessage],
-            }
-          : item,
-      ),
-    );
+    if (!isResuming) {
+      setConversations((items) =>
+        items.map((item) =>
+          item.id === conversationId
+            ? {
+                ...item,
+                title: item.messages.length ? item.title : content.slice(0, 42),
+                updated_at: new Date().toISOString(),
+                messages: [...item.messages, userMessage, assistantMessage],
+              }
+            : item,
+        ),
+      );
+    }
 
     const controller = new AbortController();
     abortRef.current = controller;
@@ -271,7 +307,9 @@ export function ChatWorkspace({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           thread_id: conversationId,
-          messages: [{ role: "user", content }],
+          ...(isResuming
+            ? { messages: [], approval_decision: approvalDecision }
+            : { messages: [{ role: "user", content }] }),
         }),
         signal: controller.signal,
       });
@@ -310,11 +348,37 @@ export function ChatWorkspace({
             .find((line) => line.startsWith("data: "))
             ?.slice(6);
           if (!data) continue;
-          const eventData = JSON.parse(data) as { content?: string; type?: string };
+          const eventData = JSON.parse(data) as {
+            content?: string;
+            type?: string;
+            tool?: string;
+            query?: string;
+          };
           if (eventData.type === "status") {
             setToolStatus(eventData.content ?? "");
+          } else if (eventData.type === "approval_required") {
+            setToolStatus("");
+            setConversations((items) =>
+              items.map((item) =>
+                item.id === conversationId
+                  ? {
+                      ...item,
+                      pending_approval: {
+                        type: "approval_required",
+                        tool: eventData.tool ?? "tavily_search",
+                        query: eventData.query ?? "",
+                      },
+                    }
+                  : item,
+              ),
+            );
           } else if (eventData.type === "message") {
             setToolStatus("");
+            setConversations((items) =>
+              items.map((item) =>
+                item.id === conversationId ? { ...item, pending_approval: null } : item,
+              ),
+            );
             appendChunk(eventData.content ?? "");
           }
         }
@@ -327,6 +391,8 @@ export function ChatWorkspace({
           summaries.map((summary) => ({
             ...summary,
             messages: items.find((item) => item.id === summary.id)?.messages ?? [],
+            pending_approval:
+              items.find((item) => item.id === summary.id)?.pending_approval ?? null,
           })),
         );
       } catch {
@@ -334,19 +400,21 @@ export function ChatWorkspace({
       }
     } catch (caught) {
       const wasAborted = caught instanceof DOMException && caught.name === "AbortError";
-      setConversations((items) =>
-        items.map((item) =>
-          item.id === conversationId
-            ? {
-                ...item,
-                messages: item.messages.filter(
-                  (message, index) =>
-                    !(index === item.messages.length - 1 && message.role === "assistant" && !message.content),
-                ),
-              }
-            : item,
-        ),
-      );
+      if (!isResuming) {
+        setConversations((items) =>
+          items.map((item) =>
+            item.id === conversationId
+              ? {
+                  ...item,
+                  messages: item.messages.filter(
+                    (message, index) =>
+                      !(index === item.messages.length - 1 && message.role === "assistant" && !message.content),
+                  ),
+                }
+              : item,
+          ),
+        );
+      }
       if (!wasAborted) {
         setError(caught instanceof Error ? caught.message : "Something went wrong.");
         setIsOnline(false);
@@ -356,6 +424,10 @@ export function ChatWorkspace({
       setToolStatus("");
       setIsLoading(false);
     }
+  };
+
+  const respondToApproval = (decision: "approve" | "reject") => {
+    void sendMessage(undefined, undefined, decision);
   };
 
   const stopResponse = () => abortRef.current?.abort();
@@ -448,6 +520,13 @@ export function ChatWorkspace({
                   message={message}
                   isLoadingLast={isLoading && index === activeConversation.messages.length - 1}
                   toolStatus={index === activeConversation.messages.length - 1 ? toolStatus : ""}
+                  pendingApproval={
+                    index === activeConversation.messages.length - 1
+                      ? activeConversation.pending_approval ?? null
+                      : null
+                  }
+                  approvalBusy={isLoading}
+                  onApproval={respondToApproval}
                 />
               ))}
               <div ref={bottomRef} />

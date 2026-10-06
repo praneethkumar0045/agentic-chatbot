@@ -1,4 +1,5 @@
 from collections.abc import Generator
+from contextlib import asynccontextmanager
 
 import pytest
 from fastapi.testclient import TestClient
@@ -12,6 +13,13 @@ from app.db.base import Base
 from app.db.session import get_db
 from app.models import Conversation
 from app.security import auth as auth_security
+from app.services import chat_service
+
+
+@asynccontextmanager
+async def chat_test_lifespan(app):
+    app.state.chatbot = chat_service._build_chatbot(chat_service.llm, chat_service.tools)
+    yield
 
 
 @pytest.fixture
@@ -29,7 +37,7 @@ def client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None, None]
         with test_session() as session:
             yield session
 
-    app = create_app()
+    app = create_app(lifespan_context=chat_test_lifespan)
     app.dependency_overrides[get_db] = override_get_db
     app.state.test_session_factory = test_session
     with TestClient(app) as test_client:
@@ -125,7 +133,7 @@ def test_chat_requires_owned_thread_and_uses_conversation_id(
     monkeypatch.setattr(
         chat_router.chat_service,
         "chat",
-        lambda messages, thread_id: calls.append(thread_id) or [],
+        lambda messages, thread_id, **kwargs: calls.append(thread_id) or [],
     )
     payload = {"thread_id": thread_id, "messages": [{"role": "user", "content": "Hello Medha"}]}
 
@@ -154,8 +162,9 @@ def test_chat_persists_history_and_reuses_it_for_follow_up_turns(
     thread_id = client.post("/api/v1/conversations", json={}, headers=headers).json()["id"]
     received_histories: list[list[tuple[str, str]]] = []
 
-    def fake_chat(messages, thread_id):
-        received_histories.append([(message.role, message.content) for message in messages])
+    def fake_chat(messages, thread_id, *, fallback_history=None, **kwargs):
+        full_history = [*(fallback_history or []), *messages]
+        received_histories.append([(message.role, message.content) for message in full_history])
         history = [
             HumanMessage(content=message.content)
             if message.role == "user"
@@ -207,7 +216,7 @@ def test_stream_chat_checks_ownership_before_starting_stream(
     thread_id = client.post("/api/v1/conversations", json={}, headers=auth(first_token)).json()["id"]
     calls: list[tuple[str, list[tuple[str, str]]]] = []
 
-    def fake_stream(messages, thread_id):
+    def fake_stream(messages, thread_id, *, fallback_history=None, **kwargs):
         calls.append((thread_id, [(message.role, message.content) for message in messages]))
         yield type(
             "ToolCallChunk",
@@ -253,7 +262,7 @@ def test_stream_chat_checks_ownership_before_starting_stream(
     assert follow_up.status_code == 200
     assert calls[-1] == (
         thread_id,
-        [("user", "Hello"), ("assistant", "ok"), ("user", "Follow-up")],
+        [("user", "Follow-up")],
     )
     detail = client.get(f"/api/v1/conversations/{thread_id}", headers=auth(first_token))
     assert detail.json()["messages"] == [
@@ -261,4 +270,101 @@ def test_stream_chat_checks_ownership_before_starting_stream(
         {"role": "assistant", "content": "ok", "metadata": None},
         {"role": "user", "content": "Follow-up", "metadata": None},
         {"role": "assistant", "content": "ok", "metadata": None},
+    ]
+
+
+@pytest.mark.parametrize(
+    ("decision", "expected_answer"),
+    [("approve", "Answer using the search"), ("reject", "Answer without the search")],
+)
+def test_tavily_approval_resumes_same_thread_without_duplicate_messages(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    decision: str,
+    expected_answer: str,
+) -> None:
+    import app.api.v1.router as chat_router
+
+    token = create_user(client, f"approval-{decision}@example.com")
+    headers = auth(token)
+    thread_id = client.post("/api/v1/conversations", json={}, headers=headers).json()["id"]
+    approvals: dict[str, dict[str, str]] = {}
+    calls: list[tuple[str, list[tuple[str, str]], str | None]] = []
+    monkeypatch.setattr(
+        chat_router.chat_service,
+        "pending_approval",
+        lambda chatbot, current_thread_id: approvals.get(current_thread_id),
+    )
+
+    def fake_stream(
+        messages,
+        thread_id,
+        *,
+        approval_decision=None,
+        **kwargs,
+    ):
+        calls.append(
+            (
+                thread_id,
+                [(message.role, message.content) for message in messages],
+                approval_decision,
+            )
+        )
+        if approval_decision is None:
+            approvals[thread_id] = {
+                "type": "approval_required",
+                "tool": "tavily_search",
+                "query": "current weather",
+            }
+            yield approvals[thread_id]
+            return
+
+        assert approval_decision in {"approve", "reject"}
+        approvals.pop(thread_id)
+        yield type("Chunk", (), {"content": expected_answer, "type": "AIMessageChunk"})()
+
+    monkeypatch.setattr(chat_router.chat_service, "stream_chat", fake_stream)
+
+    initial = client.post(
+        "/api/v1/chat/stream",
+        json={
+            "thread_id": thread_id,
+            "messages": [{"role": "user", "content": "What is the current weather?"}],
+        },
+        headers=headers,
+    )
+
+    assert initial.status_code == 200
+    assert f"event: approval_required\ndata: " in initial.text
+    assert '"tool": "tavily_search"' in initial.text
+    assert '"query": "current weather"' in initial.text
+    assert client.get(f"/api/v1/conversations/{thread_id}", headers=headers).json()[
+        "pending_approval"
+    ] == {
+        "type": "approval_required",
+        "tool": "tavily_search",
+        "query": "current weather",
+    }
+
+    resumed = client.post(
+        "/api/v1/chat/stream",
+        json={"thread_id": thread_id, "messages": [], "approval_decision": decision},
+        headers=headers,
+    )
+    detail = client.get(f"/api/v1/conversations/{thread_id}", headers=headers).json()
+
+    assert resumed.status_code == 200
+    assert expected_answer in resumed.text
+    assert detail["pending_approval"] is None
+    assert [(message["role"], message["content"]) for message in detail["messages"]] == [
+        ("user", "What is the current weather?"),
+        ("assistant", expected_answer),
+    ]
+    assert calls == [
+        (
+            thread_id,
+            [("user", "What is the current weather?")],
+            None,
+        ),
+        (thread_id, [], decision),
     ]

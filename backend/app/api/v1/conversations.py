@@ -1,12 +1,17 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Response, status
+from fastapi import APIRouter, Depends, Request, Response, status
 from sqlalchemy.orm import Session
 
 from app.api.v1.auth import get_current_user
 from app.db.session import get_db
 from app.models import User
-from app.schemas.conversation import ConversationCreate, ConversationRead, ConversationSummary
+from app.services import chat_service
+from app.schemas.conversation import (
+    ConversationCreate,
+    ConversationRead,
+    ConversationSummary,
+)
 from app.services import conversation_service
 
 
@@ -26,7 +31,12 @@ def list_conversations(db: DatabaseSession, user: CurrentUser):
 
 
 @router.get("/{thread_id}", response_model=ConversationRead)
-def get_conversation(thread_id: str, db: DatabaseSession, user: CurrentUser):
+def get_conversation(
+    thread_id: str,
+    request: Request,
+    db: DatabaseSession,
+    user: CurrentUser,
+):
     conversation = conversation_service.get_owned_conversation(db, user, thread_id)
     return ConversationRead(
         id=conversation.id,
@@ -34,6 +44,10 @@ def get_conversation(thread_id: str, db: DatabaseSession, user: CurrentUser):
         created_at=conversation.created_at,
         updated_at=conversation.updated_at,
         messages=conversation.messages,
+        pending_approval=chat_service.pending_approval(
+            request.app.state.chatbot,
+            thread_id,
+        ),
     )
 
 

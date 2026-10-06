@@ -1,4 +1,5 @@
 from collections.abc import Generator
+from contextlib import asynccontextmanager
 
 import pytest
 from fastapi.testclient import TestClient
@@ -11,6 +12,13 @@ from app.db.base import Base
 from app.db.session import get_db
 from app.models import RefreshToken
 from app.security import auth as auth_security
+from app.services import chat_service
+
+
+@asynccontextmanager
+async def chat_test_lifespan(app):
+    app.state.chatbot = chat_service._build_chatbot(chat_service.llm, chat_service.tools)
+    yield
 
 
 @pytest.fixture
@@ -30,7 +38,7 @@ def client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None, None]
         with test_session() as session:
             yield session
 
-    app = create_app()
+    app = create_app(lifespan_context=chat_test_lifespan)
     app.state.test_session_factory = test_session
     app.dependency_overrides[get_db] = override_get_db
     with TestClient(app) as test_client:

@@ -162,6 +162,14 @@ button { color: inherit; }
 .typing i:nth-child(2) { animation-delay: .15s; }.typing i:nth-child(3) { animation-delay: .3s; }
 .tool-status { display: inline-flex; align-items: center; gap: 9px; padding: 9px 12px; color: #687565; background: #f5f7f2; border: 1px solid #e7ebe2; border-radius: 10px; font-size: 12px; line-height: 1.4; }
 .tool-status-spinner { width: 13px; height: 13px; border: 2px solid #d9e1d5; border-top-color: #6e896f; border-radius: 50%; animation: tool-spin .8s linear infinite; }
+.approval-card { display: grid; gap: 8px; width: min(390px, 100%); margin-top: 14px; padding: 15px; border: 1px solid #e4e8df; border-radius: 12px; color: #55594f; background: #fffefa; box-shadow: 0 5px 20px #38452b08; font-size: 12px; line-height: 1.5; }
+.approval-card strong { color: #353b34; font-size: 13px; font-weight: 650; }
+.approval-card q { overflow-wrap: anywhere; padding: 8px 10px; border-left: 2px solid #9aaf98; border-radius: 0 6px 6px 0; color: #60685c; background: #f5f7f2; }
+.approval-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 3px; }
+.approval-actions button { min-height: 33px; padding: 0 11px; border: 1px solid #e3e5de; border-radius: 7px; color: #62665d; background: #fff; font-size: 11px; font-weight: 550; cursor: pointer; }
+.approval-actions button:last-child { border-color: #587660; color: #fff; background: #5f7d67; }
+.approval-actions button:last-child:hover { background: #4d6c56; }
+.approval-actions button:disabled { cursor: wait; opacity: .6; }
 @keyframes tool-spin { to { transform: rotate(360deg); } }
 
 .composer-wrap { width: min(700px, calc(100% - 48px)); margin: 0 auto; padding: 9px 0 18px; }

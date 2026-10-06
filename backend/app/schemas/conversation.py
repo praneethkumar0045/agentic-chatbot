@@ -26,5 +26,12 @@ class ConversationSummary(BaseModel):
     updated_at: datetime
 
 
+class PendingApproval(BaseModel):
+    type: str
+    tool: str
+    query: str
+
+
 class ConversationRead(ConversationSummary):
     messages: list[ChatMessage] = Field(default_factory=list)
+    pending_approval: PendingApproval | None = None
